@@ -10,7 +10,7 @@
 - **多竞品对比**：支持 2~3 个竞品横向对比，输出对比矩阵、SWOT、选型建议
 - **多 Agent 协作**：Planner / Collector / Analyzer / Writer 四节点协同
 - **质量校验与重试**：Analyzer 后自动检查质量，不达标自动重新采集
-- **RAG 记忆机制**：分析完成后报告自动入库，下次分析相似竞品时检索历史作为参考
+- **RAG 记忆机制**：分析完成后报告自动索引，下次分析相似竞品时检索历史作为参考
 - **实时进度推送**：SSE 流式显示每一步执行状态
 - **完整评估体系**：LangSmith + 9 个自定义评估器，支持 baseline 对比
 - **报告导出**：支持导出 Markdown 和 PDF
@@ -26,7 +26,7 @@
 | 前端 | Vue3 + TypeScript + Ant Design Vue |
 | LLM | DeepSeek（可切换任意 OpenAI 兼容模型） |
 | 搜索 | Tavily API |
-| 向量检索 | Chroma + BAAI/bge-small-zh-v1.5 |
+| 向量检索 | Qdrant Cloud + BAAI/bge-small-zh-v1.5 |
 | 长期记忆 | LangGraph InMemoryStore |
 | 文档渲染 | Markdown + marked |
 | PDF 导出 | html2canvas + jsPDF |
@@ -96,7 +96,7 @@
                           ▼
               ┌────────────────────────┐
               │   ReportIndexer        │  → 报告入库
-              │   （RAG 写入）           │    更新用户记忆
+              │   （Qdrant 写入）       │    更新用户记忆
               └───────────┬────────────┘
                           ▼
                   ┌───────────────┐
@@ -118,20 +118,22 @@ FastAPI SSE 实时推送 + LangSmith 追踪
 | **Writer** | 所有 TaskSummary | 完整 Markdown 报告 |
 | **ComparisonAnalyst** | 多竞品的所有 TaskSummary | 对比矩阵 + 洞察 |
 | **ComparisonWriter** | 对比矩阵 + 洞察 | 对比报告 |
-| **ReportIndexer** | 最终报告 | 索引到 Chroma + 更新用户记忆 |
+| **ReportIndexer** | 最终报告 | 按标题分块索引到 Qdrant + 更新用户记忆 |
 
 ---
 
 ## RAG 与记忆机制
 
-本项目引入轻量级的 RAG（检索增强生成）和 Memory 机制，让 Agent 具备"记忆"能力。
+本项目引入基于 **Qdrant Cloud** 的 RAG（检索增强生成）和 Memory 机制，让 Agent 具备跨会话的"记忆"能力。
 
 ### 工作原理
 
-1. **报告入库**：每次分析完成后，`ReportIndexer` 节点将报告以向量形式存入 Chroma
-2. **历史检索**：分析新竞品时，`MemoryRetriever` 节点从 Chroma 检索相似历史报告
-3. **上下文注入**：检索到的历史内容注入 Planner 和 Analyzer 的 Prompt，作为分析参考
-4. **偏好记忆**：使用 `InMemoryStore` 记录用户分析偏好，跨会话共享
+1. **报告分块**：分析完成后，`ReportIndexer` 节点用 `MarkdownHeaderTextSplitter` 按 `#`/`##`/`###` 标题将报告切分为语义完整的章节块
+2. **元数据索引**：每个块携带 `competitor`、`section`、`chunk_index`、`report_id` 四个元数据字段，其中 `competitor` 创建为 keyword 索引
+3. **向量入库**：分块内容经 `BAAI/bge-small-zh-v1.5` 嵌入后写入 Qdrant Cloud
+4. **历史检索**：分析新竞品时，`MemoryRetriever` 节点用 metadata filter 限定竞品范围，检索 Top-5 相似章节块
+5. **上下文注入**：检索到的章节内容注入 Planner 和 Analyzer 的 Prompt，作为分析参考
+6. **偏好记忆**：使用 `InMemoryStore` 记录用户分析偏好，跨会话共享
 
 ### 工作流变化
 
@@ -145,7 +147,7 @@ START → MemoryRetriever → Planner → Collector → Analyzer
 
 | 组件 | 选择 | 理由 |
 |------|------|------|
-| 向量库 | Chroma | 轻量、本地持久化、零配置 |
+| 向量库 | Qdrant Cloud | 元数据过滤强、gRPC 低延迟 |
 | 嵌入模型 | BAAI/bge-small-zh-v1.5 | 中文友好、模型轻量（约 80MB） |
 | 记忆存储 | LangGraph InMemoryStore | 与 LangGraph 原生集成 |
 
@@ -153,23 +155,11 @@ START → MemoryRetriever → Planner → Collector → Analyzer
 
 ## 数据存储
 
-### 报告持久化：JSON 文件
-
-本项目采用文件系统作为报告持久化方案，不依赖数据库。
+### 报告持久化：JSON 文件 + Qdrant 向量库
 
 **存储位置**：
 
-```
-backend/data/
-├── reports/          # 报告 JSON 文件
-│   ├── 16af0f07.json
-│   └── ...
-└── chroma_db/        # RAG 向量库
-    ├── chroma.sqlite3
-    └── ...
-```
-
-每个报告独立一个 JSON 文件，文件名为 `{report_id}.json`（8 位 UUID）。如果未来报告量级超过 1000 份，或需要多用户隔离、全文搜索，可迁移到 SQLite / PostgreSQL。
+每个报告独立一个 JSON 文件，文件名为 `{report_id}.json`（8 位 UUID）。
 
 ### 数据隔离说明
 
@@ -209,6 +199,7 @@ backend/data/
 - LLM API Key
 - Tavily API Key
 - LangSmith API Key
+- Qdrant Cloud 账号
 
 ### 后端
 
@@ -265,7 +256,8 @@ competitor-analysis-agent/
 │   │   │   ├── comparison_writer.py
 │   │   │   └── report_indexer.py
 │   │   ├── memory/
-│   │   │   └── memory_manager.py
+│   │   │   ├── memory_manager.py    
+│   │   │   └── text_splitter.py     
 │   │   ├── services/
 │   │   │   ├── search_service.py
 │   │   │   └── report_service.py
@@ -277,8 +269,7 @@ competitor-analysis-agent/
 │   │       ├── evaluators.py
 │   │       └── run_eval.py
 │   ├── data/
-│   │   ├── reports/
-│   │   └── chroma_db/
+│   │   └── reports/                 
 │   ├── requirements.txt
 │   └── .env.example
 ├── frontend/
